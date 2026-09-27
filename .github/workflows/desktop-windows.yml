@@ -1,0 +1,107 @@
+# Build the Windows x64 desktop application in a fork.
+#
+# `package:desktop:win:x64:unsigned` prepares the bundled runtime and runs
+# electron-builder without the EV certificate, COS bucket, and update feed the signed
+# release commands require, so every input is public and a fork can produce an
+# installer. The signed commands stay unavailable here.
+#
+# Two host tools decide whether the sequence can run, and the command probes both
+# before it starts: Visual Studio C++ build tools carrying
+# `Microsoft.VisualStudio.Component.VC.Tools.x86.x64` (the NSIS install pages compile
+# an x86 DWM helper, and node-gyp compiles the native modules) and the `tar` archive
+# reader. Python builds those native modules during install.
+name: Desktop Windows (unsigned)
+
+on:
+  # Manual runs are the normal path; tag pushes keep one installer per release tag.
+  workflow_dispatch:
+  push:
+    tags:
+      - 'dsh-v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Supported Node line (`^22.19.0 || >=24`); the packaged payload carries its own pinned runtime.
+  PRIMARY_NODE_VERSION: '24'
+
+jobs:
+  win-x64:
+    name: win x64 / unsigned installer
+    # Windows Server 2025 carries the Visual Studio 2022 C++ workload the installer helper compiles against.
+    runs-on: windows-2025
+    # A cold run prepares the runtime, packs every workspace package, and rebuilds the dsh tree.
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+          cache: pnpm
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        shell: pwsh
+        run: pnpm install --frozen-lockfile
+      # Archives whose names carry their version and whose hashes are verified at every use,
+      # so a restored cache entry is reused rather than trusted.
+      - name: Restore the runtime and Electron archive cache
+        uses: actions/cache@v4
+        with:
+          path: apps/desktop/.desktop-build/downloads
+          key: ${{ runner.os }}-desktop-downloads-${{ hashFiles('scripts/primary-runtime/lock.json', 'apps/desktop/package.json') }}
+      - name: Resolve the product version
+        shell: pwsh
+        run: |
+          $version = (Get-Content apps/desktop/package.json -Raw | ConvertFrom-Json).version
+          "DSH_PRODUCT_VERSION=$version" | Add-Content -Path $env:GITHUB_ENV
+      # The packaging scripts read release settings from this file alone and drop ambient
+      # DSH_DESKTOP_* variables, so CI writes the file instead of exporting an environment.
+      # Repository variables override the placeholder identifiers; an unsigned build only
+      # needs an application id and the policy origin, and never dials either one.
+      - name: Write the Windows release settings
+        shell: pwsh
+        run: |
+          Set-Content -Path apps/desktop/.env.windows -Encoding utf8 -Value @(
+            "DSH_DESKTOP_APP_ID=${{ vars.DSH_DESKTOP_APP_ID || 'com.example.deepseek-harness' }}"
+            "DSH_DESKTOP_AUTO_UPDATE_ENV=production"
+            "DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=${{ vars.DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN || 'https://example.com' }}"
+          )
+      - name: Package the Windows x64 desktop application
+        shell: pwsh
+        run: pnpm run package:desktop:win:x64:unsigned
+      - name: List the produced artifacts
+        if: success()
+        shell: pwsh
+        run: Get-ChildItem apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts -File |
+          Select-Object Name, Length
+      - name: Upload the installer
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: deepseek-harness-${{ env.DSH_PRODUCT_VERSION }}-win-x64-unsigned
+          path: |
+            apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe
+            apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.blockmap
+          if-no-files-found: error
+          # NSIS already compresses the payload, so recompressing it only spends runner time.
+          compression-level: 0
+          retention-days: 14
+      # The packaging run journal names each stage, the tool it used, and its failure detail.
+      - name: Upload the packaging run journal
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-packaging-runs
+          path: apps/desktop/.desktop-build/packaging-runs/**
+          if-no-files-found: ignore
+          retention-days: 7
